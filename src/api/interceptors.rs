@@ -3,6 +3,8 @@
 //! interceptors is to authenticate the clients to ZITADEL with
 //! provided credentials.
 
+use std::ops::Deref;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use tokio::runtime::Builder;
@@ -41,6 +43,7 @@ use crate::credentials::{AuthenticationOptions, ServiceAccount};
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct AccessTokenInterceptor {
     access_token: String,
 }
@@ -125,12 +128,21 @@ impl Interceptor for AccessTokenInterceptor {
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct ServiceAccountInterceptor {
+    inner: Arc<ServiceAccountInterceptorInner>,
+}
+
+struct ServiceAccountInterceptorInner {
     audience: String,
     service_account: ServiceAccount,
     auth_options: AuthenticationOptions,
-    token: Option<String>,
-    token_expiry: Option<time::OffsetDateTime>,
+    state: RwLock<Option<ServiceAccountInterceptorState>>,
+}
+
+struct ServiceAccountInterceptorState {
+    token: String,
+    token_expiry: time::OffsetDateTime,
 }
 
 impl ServiceAccountInterceptor {
@@ -144,11 +156,12 @@ impl ServiceAccountInterceptor {
         auth_options: Option<AuthenticationOptions>,
     ) -> Self {
         Self {
-            audience: audience.to_string(),
-            service_account: service_account.clone(),
-            auth_options: auth_options.unwrap_or_default(),
-            token: None,
-            token_expiry: None,
+            inner: Arc::new(ServiceAccountInterceptorInner {
+                audience: audience.to_string(),
+                service_account: service_account.clone(),
+                auth_options: auth_options.unwrap_or_default(),
+                state: RwLock::new(None),
+            }),
         }
     }
 }
@@ -157,25 +170,30 @@ impl Interceptor for ServiceAccountInterceptor {
     fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
         let meta = request.metadata_mut();
         if !meta.contains_key("authorization") {
-            if let Some(token) = &self.token {
-                if let Some(expiry) = self.token_expiry {
-                    if expiry > time::OffsetDateTime::now_utc() {
-                        meta.insert(
-                            "authorization",
-                            format!("Bearer {}", token).parse().unwrap(),
-                        );
+            let state_read_guard = self.inner.state.read().unwrap(); //TODO check if unwrap ok
 
-                        return Ok(request);
-                    }
+            if let Some(ServiceAccountInterceptorState {
+                token,
+                token_expiry,
+            }) = state_read_guard.deref()
+            {
+                if token_expiry > &time::OffsetDateTime::now_utc() {
+                    meta.insert(
+                        "authorization",
+                        format!("Bearer {}", token).parse().unwrap(),
+                    );
+
+                    return Ok(request);
                 }
             }
+            drop(state_read_guard);
 
-            let aud = self.audience.clone();
-            let auth = self.auth_options.clone();
-            let sa = self.service_account.clone();
+            let aud = self.inner.audience.clone();
+            let auth = self.inner.auth_options.clone();
+            let sa = self.inner.service_account.clone();
 
             let token = thread::spawn(move || {
-                let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+                let rt = Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(async {
                     sa.authenticate_with_options(&aud, &auth)
                         .await
@@ -187,8 +205,12 @@ impl Interceptor for ServiceAccountInterceptor {
                 .join()
                 .map_err(|_| Status::internal("could not fetch token"))??;
 
-            self.token = Some(token.clone());
-            self.token_expiry = Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(59));
+            let mut state_write_guard = self.inner.state.write().unwrap(); // TODO check if unwrap correct
+
+            *state_write_guard = Some(ServiceAccountInterceptorState {
+                token: token.clone(),
+                token_expiry: time::OffsetDateTime::now_utc() + time::Duration::minutes(59),
+            });
 
             meta.insert(
                 "authorization",
@@ -333,10 +355,28 @@ mod tests {
         let sa = ServiceAccount::load_from_json(SERVICE_ACCOUNT).unwrap();
         let mut interceptor = ServiceAccountInterceptor::new(ZITADEL_URL, &sa, None);
         interceptor.call(Request::new(())).unwrap();
-        let token = interceptor.token.clone().unwrap();
+        let token = interceptor
+            .inner
+            .state
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
         interceptor.call(Request::new(())).unwrap();
 
-        assert_eq!(token, interceptor.token.unwrap());
+        assert_eq!(
+            token,
+            interceptor
+                .inner
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .token
+        );
     }
 
     #[tokio::test]
@@ -344,9 +384,27 @@ mod tests {
         let sa = ServiceAccount::load_from_json(SERVICE_ACCOUNT).unwrap();
         let mut interceptor = ServiceAccountInterceptor::new(ZITADEL_URL, &sa, None);
         interceptor.call(Request::new(())).unwrap();
-        let token = interceptor.token.clone().unwrap();
+        let token = interceptor
+            .inner
+            .state
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
         interceptor.call(Request::new(())).unwrap();
 
-        assert_eq!(token, interceptor.token.unwrap());
+        assert_eq!(
+            token,
+            interceptor
+                .inner
+                .state
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .token
+        );
     }
 }
